@@ -1,3 +1,6 @@
+# Project specific settings
+PSRC ?=
+RSRC ?= $(PWD)/../..
 
 SIM ?= ghdl
 TOPLEVEL_LANG ?= vhdl
@@ -11,11 +14,16 @@ TOPLEVEL_LANG ?= vhdl
 # 	$(PWD)/../hdl/mm_mod.vhdl \
 # 	$(PWD)/../hdl/stage/mm_pipe_load.vhdl
 
-VHDL_SOURCES += $(PWD)../../hdl/mm_mod.vhdl
+VHDL_SOURCES += \
+				$(PWD)/tb_mm_mod.vhdl \
+				$(RSRC)/hdl/mm_mod.vhdl \
+				$(RSRC)/hdl/stage/mm_mult_stage.vhdl \
+				$(RSRC)/hdl/pkg/mm_mod_pkg.vhdl
 
 
-TOPLEVEL = mm_mult
-MODULE = tb_mm
+
+TOPLEVEL = tb_mm_mod
+MODULE = tb_mm_mod
 
 EXTRA_ARGS = -fsynopsys -fexplicit --std=08
 SIM_ARGS ?= --wave=waveform.ghw

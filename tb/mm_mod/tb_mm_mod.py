@@ -10,4 +10,7 @@ async def test_mm_mod(dut):
     start_soon(clock.start(start_high=False))
 
     # testing out the mm_mod
+    dut.op_a_address.value = 0x42
+
+    await ClockCycles(dut.CLK, 5)
 
