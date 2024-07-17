@@ -70,9 +70,10 @@ architecture rtl of mm_bram_ctrl is
   signal primitive_out    : std_logic;
   signal primitive_delay  : std_logic;
 
+  -- control signals for read latency
   constant READ_LATENCY   : integer := 2;
   signal latency_counter  : integer;
-  signal latecy_exh : std_logic;
+  signal latency_exh      : std_logic;
 
 begin
   -- bram controller functionality
