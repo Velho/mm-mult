@@ -1,3 +1,4 @@
+-- vim: noai:ts=2:sw=2
 ----------------------------------------------------------------------------------
 -- Company: 
 -- Engineer: 
@@ -21,6 +22,7 @@
 library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
+use ieee.std_logic_arith.all;
 use work.mm_mod_pkg.all;
 
 -- Uncomment the following library declaration if using
@@ -35,6 +37,7 @@ use UNISIM.VComponents.all;
 entity sim_mm_mod is
   --  Port ( );
 end sim_mm_mod;
+
 architecture Behavioral of sim_mm_mod is
 
   constant half_period         : time      := 1 ns;
@@ -44,13 +47,14 @@ architecture Behavioral of sim_mm_mod is
   -- bram size of 16K
   constant C_MM_MOD_ADDR_WIDiTH : integer := 14;
 
-  signal CLK  : std_logic;
+  signal CLK  : std_logic := '0';
   signal NRST : std_logic;
 
   signal S_CONTROL_CLEAR : std_logic;
   signal S_REQ_OP        : std_logic;
 
   signal S_REQ_STORE : std_logic;
+  signal S_BRAM_REQ_ACK : std_logic;
   signal S_BRAM_ADDR : std_logic_vector (C_MM_AXI_ADDR_WIDTH - 1 downto 0);
   signal S_BRAM_DATA : std_logic_vector (C_MM_MOD_DATA_WIDTH - 1 downto 0);
   signal OP_A        : mm_mult_op;
@@ -66,6 +70,7 @@ architecture Behavioral of sim_mm_mod is
   signal BRAM_PORTA_0_dout : std_logic_vector (63 downto 0);
   signal BRAM_PORTA_0_en   : std_logic;
   signal BRAM_PORTA_0_we   : std_logic_vector (7 downto 0);
+  signal BRAM_PORTA_0_rst  : std_logic;
 
   signal S_CTRL_ADDRESS    : std_logic_vector(31 downto 0);
   signal S_CTRL_REQ_READ   : std_logic;
@@ -73,34 +78,50 @@ architecture Behavioral of sim_mm_mod is
   signal S_CTRL_DONE       : std_logic;
   signal S_CTRL_DEBUG      : std_logic_vector(7 downto 0);
   signal S_CTRL_BUSY       : std_logic;
-  signal S_DEBUG_4         : std_logic_vector(63 downto 0);
+  signal S_DEBUG_4         : std_logic_vector(63 downto 0); 
+
+  -- unpack the operands for simulation purposes
+  signal op_a_address : std_logic_vector (31 downto 0);
+  signal op_a_length : integer;
+  signal op_b_address : std_logic_vector (31 downto 0);
+  signal op_b_length : integer;
+  signal op_n_address : std_logic_vector (31 downto 0);
+  signal op_n_length : integer;
 
 begin
 
   CLK <= not CLK after half_period when finished /= '1' else
     '0';
 
+  OP_A.BASE_ADDRESS <= std_logic_vector(op_a_address);
+  OP_B.BASE_ADDRESS <= op_b_address;
+  OP_N.BASE_ADDRESS <= op_n_address;
+  OP_A.LENGTH <= std_logic_vector(to_unsigned(op_a_length, OP_A.LENGTH'length));
+  OP_B.LENGTH <= std_logic_vector(to_unsigned(op_b_length, OP_B.LENGTH'length));
+  OP_N.LENGTH <= std_logic_vector(to_unsigned(op_n_length, OP_N.LENGTH'length));
+
   dut : entity work.mm_mod
     port map
     (
-      CLK             => CLK,
-      NRST            => NRST,
-      S_CONTROL_CLEAR => S_CONTROL_CLEAR,
-      S_REQ_OP        => S_CTRL_REQ_READ,
-      S_REQ_STORE     => S_REQ_STORE,
-      S_BRAM_ADDR     => S_BRAM_ADDR,
-      S_BRAM_DATA     => S_BRAM_DATA,
-      OP_A            => OP_A,
-      OP_B            => OP_B,
-      OP_N            => OP_N,
-      OP_MM           => OP_MM,
-      OP_RESULT       => OP_RESULT
+      CLK               => CLK,
+      NRST              => NRST,
+      S_CONTROL_CLEAR   => S_CONTROL_CLEAR,
+      S_BRAM_REQ_OP     => S_REQ_OP,
+      S_BRAM_REQ_STORE  => S_REQ_STORE,
+      S_BRAM_REQ_ACK    => S_BRAM_REQ_ACK,
+      S_BRAM_ADDR       => S_CTRL_ADDRESS,
+      S_BRAM_DATA       => S_CTRL_RD_DATA,
+      OP_A              => OP_A,
+      OP_B              => OP_B,
+      OP_N              => OP_N,
+      OP_MM             => OP_MM,
+      OP_RESULT         => OP_RESULT
     );
 
   bram : entity work.bram_design_wrapper
     port map (
       BRAM_PORTA_0_addr => S_BRAM_ADDR,
-      BRAM_PORTA_0_clk  => CLK,
+      BRAM_PORTA_0_clk  => BRAM_PORTA_0_clk,
       BRAM_PORTA_0_din  => BRAM_PORTA_0_din,
       BRAM_PORTA_0_dout => S_BRAM_DATA,
       BRAM_PORTA_0_en   => BRAM_PORTA_0_en,
@@ -112,22 +133,22 @@ begin
       CLK             => CLK,
       NRST            => NRST,
       S_BRAM_ADDR     => S_BRAM_ADDR,
-      S_BRAM_CLK      => CLK,
+      S_BRAM_CLK      => BRAM_PORTA_0_clk,
       S_BRAM_WRDATA   => BRAM_PORTA_0_din,
       S_BRAM_RDDATA   => S_BRAM_DATA,
       S_BRAM_EN       => BRAM_PORTA_0_en,
-      S_BRAM_RST      => NRST, -- not correct reset ?
+      S_BRAM_RST      => BRAM_PORTA_0_rst,
       S_BRAM_WE       => BRAM_PORTA_0_we,
       S_CTRL_ADDRESS  => S_CTRL_ADDRESS,
-      S_CTRL_REQ_READ => S_CTRL_REQ_READ,
+      S_CTRL_REQ_READ => S_REQ_OP,
       S_CTRL_RD_DATA  => S_CTRL_RD_DATA,
-      S_CTRL_DONE     => S_CTRL_DONE,
+      S_CTRL_DONE     => S_BRAM_REQ_ACK,
       S_CTRL_DEBUG    => S_CTRL_DEBUG,
       S_CTRL_BUSY     => S_CTRL_BUSY,
       S_DEBUG_4       => S_DEBUG_4
     );
-    
-    
+
+
   process
   begin
     -- assert reset
@@ -140,20 +161,26 @@ begin
     
     -- OP_A, B and N is set through the AXI interface and needs to be set manually for this simulation
     -- each operand is 64-bits in size, so next address is always shifted by 3 to left
-    OP_A.BASE_ADDRESS <= x"0"; -- operand A stored to address x0
-    OP_B.BASE_ADDRESS <= x"8"; -- operand B stored to address x8
-    OP_N.BASE_ADDRESS <= x"10"; -- operand N stored to address x10
+    -- OP_A.BASE_ADDRESS <= x"0"; -- operand A stored to address x0
+    -- OP_B.BASE_ADDRESS <= x"8"; -- operand B stored to address x8
+    -- OP_N.BASE_ADDRESS <= x"10"; -- operand N stored to address x10
     -- result address should be place after the operand N so x24
 
+    op_a_address(31 downto 0) <= x"00000000";
+    op_a_length <= 1;
+    op_b_address(31 downto 0) <= x"00000008";
+    op_b_length <= 1;
+    op_n_address(31 downto 0) <= x"00000010";
+    op_n_length <= 1;
 
     -- perform whatever sim you want here
     S_CONTROL_CLEAR <= '1';
     wait until rising_edge (CLK);
     S_CONTROL_CLEAR <= '0';
 
+    wait for 80 ns;
 
-
-    wait for 20 ns;
+    finished <= '1';
   end process;
 
 end Behavioral;
