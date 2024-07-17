@@ -64,16 +64,10 @@ architecture rtl of mm_bram_ctrl is
   signal rd_data_avail : std_logic;
   signal read_done     : std_logic;
 
-  -- primitives output register generated for the bram
-  -- requires the clock to be stalled by one cycle before
-  -- sampling the output
-  signal primitive_out    : std_logic;
-  signal primitive_delay  : std_logic;
-
   -- control signals for read latency
   constant READ_LATENCY   : integer := 2;
   signal latency_counter  : integer;
-  signal latency_exh      : std_logic;
+  signal latency_done      : std_logic; -- latency counter exhausted
 
 begin
   -- bram controller functionality
@@ -90,14 +84,17 @@ begin
   -- fixme(ja): configuration flag to enable and disable if PRIMITIVE OUTPUT REGISTERS option for the bram is used
   -- this should disable the extra clock needed to sample the bram
 
-  S_BRAM_RST <= '0';
+  S_BRAM_RST <= bram_rst;
   S_BRAM_CLK <= CLK; -- when clock_en = '1' else '0';
-  S_BRAM_ADDR <= read_addr when addr_set = '1' else
-    (others => '0');
-  S_BRAM_EN <= '1' when bram_en = '1' else '0';
+  S_BRAM_ADDR <= read_addr;
+  S_BRAM_EN <= bram_en;
 
   S_DEBUG_4 <= S_BRAM_RDDATA;
 
+  -- TODO(ja):
+  --  bram data is available for read operation when the rd_data_avail is asserted
+  --  done could be perhaps written from the rd_data_avail instead of read_done.
+  --  this should result of samping RD_DATA one clock earlier.
   S_CTRL_DONE    <= read_done;
   S_CTRL_RD_DATA <= bram_data;
 
@@ -126,114 +123,94 @@ begin
       bram_rst  <= '0';
       bram_en   <= '0';
       read_done <= '0';
-    else
-      if rising_edge (CLK) then
-        -- read request received
-        if S_CTRL_REQ_READ = '1' then
-          clock_en  <= '1';
-          read_done <= '0';
-        end if;
-
-        -- clock started, enable bram
-        if clock_en = '1' then
-          bram_en <= '1';
-        end if;
-
-        if rd_data_avail = '1' then
-          bram_en   <= '0';
-          read_done <= '1';
-          clock_en  <= '0';
-        end if;
-
+      addr_set  <= '0';
+      read_addr <= ( others => '0' );
+    elsif rising_edge (CLK) then
+      -- read request received
+      if S_CTRL_REQ_READ = '1' then
+        clock_en  <= '1';
+        bram_rst  <= '1';
+        read_done <= '0';
       end if;
-    end if;
-  end process;
 
-  p_latency: process (CLK, NRST)
-  begin
-    if NRST = '0' then
-      latency_counter <= 0;
-    else
-
-      -- if rising_edge (CLK) then
-      --   if bram_en = '1' then
-      --     latency_counter <= 0;
-      --   elsif latency_counter = READ_LATENCY then
-      --     latency_counter <= latency_counter + 1;
-      --   else
-      --   end if;
+      -- if bram_rst = '1' then
+      --   bram_rst <= '0';
       -- end if;
 
-    end if;
-  end process;
+        -- clock started, enable bram and drive the address
+      if clock_en = '1' then
+        bram_rst <= '0';
+        bram_en <= '1';
+        read_addr <= S_CTRL_ADDRESS;
+        addr_set  <= '1';
+      end if;
 
-  -- todo: replace this primitve output register delay with counter
-  -- delays the sampling by one clock
-  p_primitive_out : process (CLK, NRST, addr_set, primitive_out, read_done)
-  begin
-    if NRST = '0' then
-      primitive_out <= '0';
-      primitive_delay <= '0';
-    else
-      if rising_edge (CLK) then
-        if primitive_out = '1' then
-          primitive_out <= '0';
-        elsif addr_set = '1' and primitive_delay = '0' then
-          primitive_out <= '1';
-          primitive_delay <= '1';
-        end if;
+      if rd_data_avail = '1' then
+        bram_en   <= '0';
+        read_done <= '1';
+        clock_en  <= '0';
+      end if;
 
-        -- reset flops after read_done
-        if read_done = '1' then
-          primitive_delay <= '0';
-        end if;
+      if read_done = '1' then
+        addr_set <= '0';
+        read_done <= '0';
       end if;
     end if;
   end process;
 
-  -- process bram address
-  -- IN: bram_rst - asserted reset signal from register
-  -- implements the address latching for the bram
-  p_bram_addr : process (CLK, NRST, bram_en, clock_en, read_done)
+  -- bram read latency
+  -- IN: bram_en - bram enabled
+  --
+  -- implements the specific read latency defined by the 
+  -- xilinx block memory generator. latency can be read from
+  -- the block memory generator summary.
+  -- takes into account the clock cycle it takes to start the
+  -- counter so subtract from the constant.
+  -- todo(ja): perhaps counter could be generic input for the controller ?
+  p_latency_counter : process (CLK, NRST, bram_en)
   begin
     if NRST = '0' then
-      addr_set  <= '0';
-      read_addr <= (others => '0');
-    else
-      if rising_edge (CLK) then
-        -- fixme(ja): setting addr_set 
-        if bram_en = '1' then
-          read_addr <= S_CTRL_ADDRESS;
-          addr_set  <= '1';
-        end if;
+      latency_done <= '0';
+      latency_counter <= 0;
+    elsif rising_edge (CLK) then
 
-        if read_done = '1' then
-          addr_set  <= '0';
-          read_addr <= (others => '0');
-        end if;
+      -- FIXME(ja): condition seems little wrong but it works
+      -- basically when the latency has been exhausted and bram is still
+      -- enabled, latency exhaust shouldn't be set to 0
 
-      end if; -- CLK
-    end if; -- NRST
+      -- it takes 1 clock cycle to start the latency counter so
+      -- count until - 1 from the latency constant so we can sample
+      -- data one clock cycle after the latency counter is done
+      if bram_en = '1' then
+        if latency_done = '1' then
+          latency_counter <= 0;
+        elsif latency_counter = READ_LATENCY-1 then
+          latency_done <= '1';
+        else
+          latency_counter <= latency_counter + 1;
+        end if;
+      else
+        latency_counter <= 0;
+        latency_done <= '0';
+      end if;
+    end if;
   end process;
 
-  p_read_bram : process (CLK, NRST, S_BRAM_RDDATA, addr_set, read_done, primitive_out)
+  p_read_bram : process (CLK, NRST, S_BRAM_RDDATA, addr_set, read_done, latency_done)
   begin
     if NRST = '0' then
       bram_data     <= (others => '0');
       rd_data_avail <= '0';
-    else
-      if rising_edge (CLK) then
-        -- sample the read data when address has been set and primitive delay has been exhausted
-        if addr_set = '1' and primitive_out = '1' then
-          bram_data     <= S_BRAM_RDDATA; --latch the data
-          rd_data_avail <= '1';
-        end if;
+    elsif rising_edge (CLK) then
+      -- sample the read data when address has been set and primitive delay has been exhausted
+      if addr_set = '1' and latency_done = '1' then
+        rd_data_avail <= '1';
+        bram_data     <= S_BRAM_RDDATA; --latch the data
+      end if;
 
-        if read_done = '1' then
-          rd_data_avail <= '0';
-        end if;
-
-      end if; -- CLK
+      if read_done = '1' then
+        rd_data_avail <= '0';
+      end if;
     end if; -- NRST
   end process;
 
