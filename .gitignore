@@ -1,0 +1,10 @@
+.hdl_checker/
+*.o
+sim_build/
+*.pyc
+__pycache__/
+*.xml
+*.gtkw
+*.ghw
+mm_mult
+mm_mod
