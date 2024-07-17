@@ -36,7 +36,7 @@ entity mm_mod is
     C_MM_MOD_ADDR_WIDTH : integer := 14;
     C_MM_MULT_STAGE_COUNT : integer := 4
   );
-  port (
+  port(
     CLK : in std_logic; -- fabric clock
     NRST : in std_logic; -- fabric reset
 
@@ -62,13 +62,18 @@ architecture rtl of mm_mod is
   constant STAGE_COUNT      : integer := 3;
   constant MULT_STAGE_OFFS  : integer := 64;
   constant LAST_OPERAND     : mm_op_req := mm_op_n;
-  -- mm_mult_result is value type for data
 
+  -- todo(ja): could be moved to the mod_pkg
+  -- mm_mult_result is value type for data
   type mm_mult_vector is array (0 to C_MM_MULT_STAGE_COUNT-1) of mm_mult_result;
 
-  signal a_value : mm_mult_vector;
-  signal b_value : mm_mult_vector;
-  signal n_value : mm_mult_vector;
+  signal a_in : mm_mult_vector;
+  signal b_in : mm_mult_vector;
+  signal n_in : mm_mult_vector;
+
+  signal a_count : integer;
+  signal b_count : integer;
+  signal n_count : integer;
 
   -- bram control signals
   signal bram_addr : std_logic_vector (C_MM_AXI_ADDR_WIDTH-1 downto 0);
@@ -94,39 +99,182 @@ architecture rtl of mm_mod is
 
   -- have the intermediate values as unsigned ?
 
+  signal op_addr : std_logic_vector (31 downto 0);
+
+  signal next_op : std_logic; -- assert to transition next operand
+  signal op_a_in_rdy : std_logic;
+  signal op_b_in_rdy : std_logic;
+  signal op_n_in_rdy : std_logic;
+  signal op_in_rdy : std_logic;
+
+  signal bram_wait : std_logic;
+  signal bram_req_initd : std_logic; -- request has been initiated, requires completion to deassert
+  signal bram_sampled : std_logic;
+
+  -- stage transition load
+  signal stage_tr_load : std_logic;
+  signal prev_op : mm_op_req;
+  signal op_changed : std_logic;
+
 begin
 
   S_BRAM_REQ_OP     <= bram_read_request;
   S_BRAM_REQ_STORE  <= bram_write_request;
 
+  -- bram_wait is not correct condition signal, take sampling into account if anything
+  S_BRAM_ADDR <= op_addr; -- when bram_wait = '1' else ( others => '0' );
+
+  -- drive op_request before transitioning to load stage
+  op_request <= '1' when S_CONTROL_CLEAR = '1' and current_mod_stage = mm_stage_idle else '0';
+
+  -- mux correct operand address based on the current operand in progress
+  op_addr <= OP_A.BASE_ADDRESS when (current_op_req = mm_op_a) else
+             OP_B.BASE_ADDRESS when (current_op_req = mm_op_b) else
+             OP_N.BASE_ADDRESS when (current_op_req = mm_op_n) else
+             ( others => '0' );
+
 
   -- 1.
   -- start by performing bram read for the different operations
-  -- required. how many operations can be performed 
+  -- required. how many operations can be performed
 
   -- data read from the bram needs to be performed sequentially
   -- starting from the A to B to N and so on or whatever.
 
-  process (CLK, NRST)
+  -- p_op_start_req: process (CLK, NRST)
+  -- begin
+  --   -- control the op_load
+  --   -- not to do it in the next_stage as it will just
+  --   -- clutter the state transition logic
+  --   if NRST = '0' then
+  --     op_request <= '0';
+  --   elsif rising_edge (CLK) then
+  --     -- fixme(ja): is this correct condition ?
+  --     -- it takes CONTROL_CLEAR to transition to mm_stage_load
+  --     -- and CONTROL_CLEAR should be asserted for one clock cycle only
+  --     -- so if we are in the load stage already the control clear should
+  --     -- have been de-asserted but what does it then mean if control clear
+  --     -- and stage idle is the condition, do we start pulling the data
+  --     -- on the same clock as we do the transition ? at least we would need
+  --     -- to be in a proper reset state when the bram read is started
+  --     if S_CONTROL_CLEAR = '1' and current_mod_stage = mm_stage_idle then
+  --       op_request <= '1';
+  --     else
+  --       op_request <= '0';
+  --     end if;
+
+  --   end if;
+  -- end process;
+
+  -- bram request initiated with the op_request
+  -- IN:
+  --  op_changed, operand changed asserted for one clock
+  --  S_BRAM_REQ_ACK, bram acknowledgment when read is done
+  p_bram_request: process (CLK, NRST, op_changed, S_BRAM_REQ_ACK)
+    variable pval : integer := 0;
+    variable val : integer := 0;
   begin
-    -- control the op_load
-    -- not to do it in the next_stage as it will just
-    -- clutter the state transition logic
     if NRST = '0' then
-      op_request <= '0';
+      bram_wait <= '0';
     elsif rising_edge (CLK) then
-      -- fixme(ja): is this correct condition ?
-      -- it takes CONTROL_CLEAR to transition to mm_stage_load
-      -- and CONTROL_CLEAR should be asserted for one clock cycle only
-      -- so if we are in the load stage already the control clear should
-      -- have been de-asserted but what does it then mean if control clear
-      -- and stage idle is the condition, do we start pulling the data
-      -- on the same clock as we do the transition ? at least we would need
-      -- to be in a proper reset state when the bram read is started
-      if S_CONTROL_CLEAR = '1' and current_mod_stage = mm_stage_idle then
-        op_request <= '1';
+
+      -- start bram read when operand has changed and
+      -- stage transitioned to load.
+      if op_changed = '1' and stage_tr_load = '1' then
+        bram_wait <= '1';
+      end if;
+
+      -- ack received, sample the data
+      if S_BRAM_REQ_ACK = '1' then
+        bram_wait <= '0';
+      end if;
+
+    end if;
+  end process;
+
+  -- bram_read_request <= bram_wait and
+
+  p_bram_load: process (CLK, NRST, S_BRAM_REQ_ACK, current_mod_stage, bram_wait, bram_read_request)
+    variable request : std_logic := '0';
+  begin
+    if NRST = '0' then
+      bram_read_request <= '0';
+      bram_req_initd    <= '0';
+    elsif rising_edge (CLK) then
+      if current_mod_stage = mm_stage_load then
+
+        request := not bram_req_initd and (bram_wait and not bram_read_request);
+
+        if request = '1' then
+          bram_read_request <= '1';
+          bram_req_initd <= '1';
+        else
+          bram_read_request <= '0';
+        end if;
+
+        if S_BRAM_REQ_ACK = '1' then
+          bram_req_initd <= '0';
+        end if;
+      end if;
+    end if;
+  end process;
+
+  -- samples the requested value from the bram to the local buffer
+  process (CLK, NRST, S_BRAM_REQ_ACK, S_BRAM_DATA, current_op_req)
+    variable store_op: std_logic := '0';
+  begin
+    if NRST = '0' then
+      bram_sampled <= '0';
+      store_op := '0';
+      bram_data <= ( others => '0' );
+      -- todo(ja): clear a_in during reset ?
+    elsif rising_edge (CLK) then
+      -- ACK is asserted for multiple clocks so use control
+      -- signal to deassert the store after assignment.
+      store_op := S_BRAM_REQ_ACK and not bram_sampled;
+
+      -- sample the result to a_value
+      if store_op = '1' then
+        bram_data <= S_BRAM_DATA;
+        bram_sampled <= '1';
+      end if;
+
+      -- de-assert when S_BRAM_REQ_ACK is as well so we write the
+      -- local buffer only once
+      if S_BRAM_REQ_ACK = '0' then
+        bram_sampled <= '0';
+      end if;
+
+    end if;
+  end process;
+
+  -- would it be possible to assign without the clock ??
+  process(CLK, NRST, bram_sampled)
+  begin
+    if NRST = '0' then
+      a_count <= 0;
+      b_count <= 0;
+      n_count <= 0;
+      op_in_rdy <= '1';
+    elsif rising_edge (CLK) then
+      if bram_sampled = '1' then
+        case current_op_req is
+          when mm_op_a =>
+            a_in(0) <= bram_data;
+            a_count <= a_count + 1;
+            op_in_rdy <= '1';
+          when mm_op_b =>
+            b_in(0) <= bram_data;
+            b_count <= b_count + 1;
+            op_in_rdy <= '1';
+          when mm_op_n =>
+            n_in(0) <= bram_data;
+            n_count <= n_count + 1;
+            op_in_rdy <= '1';
+          when others => null;
+        end case;
       else
-        op_request <= '0';
+        op_in_rdy <= '0';
       end if;
     end if;
   end process;
@@ -146,11 +294,13 @@ begin
           -- have been requested
           if op_req_completed = '1' then
             next_mod_stage <= mm_stage_mult;
-          else
-            next_mod_stage <= current_mod_stage;
+          -- else
+          --   next_mod_stage <= current_mod_stage;
           end if;
         when mm_stage_mult =>
+          next_mod_stage <= mm_stage_mult;
         when mm_stage_store =>
+          next_mod_stage <= mm_stage_store;
         when mm_stage_idle =>
           if S_CONTROL_CLEAR = '1' then
             next_mod_stage <= mm_stage_load;
@@ -166,58 +316,101 @@ begin
   -- IN: next_mod_stage
   -- stage condition handlind is done in a different process,
   -- assign the next stage to current.
-  p_stage_mm: process (CLK, NRST, next_mod_stage)
+  p_stage_mm: process (NRST, next_mod_stage)
   begin
     if NRST = '0' then
       current_mod_stage <= mm_stage_idle;
-    elsif rising_edge (CLK) then
+    else
       current_mod_stage <= next_mod_stage;
     end if;
-  end process; 
+  end process;
+
+  -- TODO(ja): decouple the op_request from first bram read
+  -- instead generalize it so after each state transition happens
+  -- bram is read
+
+  process (CLK, NRST, current_mod_stage)
+  begin
+    if NRST = '0' then
+      stage_tr_load <= '0';
+    elsif rising_edge (CLK) then
+
+      if current_mod_stage = mm_stage_load then
+        -- assert load transition signal when load stage has been set
+        if stage_tr_load = '0' then
+          stage_tr_load <= '1';
+        end if;
+      elsif current_mod_stage = mm_stage_idle then
+        -- reset the load transition signal when
+        if stage_tr_load = '1' then
+          stage_tr_load <= '0';
+        end if;
+      end if;
+    end if;
+  end process;
+
+  -- assert if op_changed when operand has changed.
+  -- used to start the bram acquistion.
+  -- IN: current_op_req - current operand
+  p_op_changed: process (CLK, NRST, current_op_req)
+  begin
+    if NRST = '0' then
+      prev_op <= mm_op_nil;
+      op_changed <= '0';
+    elsif rising_edge (CLK) then
+      if prev_op /= current_op_req then
+        prev_op <= current_op_req;
+        op_changed <= '1';
+      else
+        prev_op <= prev_op;
+        op_changed <= '0';
+      end if;
+    end if;
+  end process;
 
   -- next_op_sm: next operand state-machine
   -- valid state: stage_load
   -- IN: current_op_req
   -- state-machine handling the different transitions to pull
   -- the operands from the bram next.
-  p_next_op_sm: process (CLK, NRST, current_op_req)
+  p_next_op_sm: process (NRST, prev_op, current_op_req, stage_tr_load, op_in_rdy)
   begin
     if NRST = '0' then
       next_op_req <= mm_op_nil;
-    elsif rising_edge (CLK) then
-      -- only run the operand requests when load stage is set
+    else
+      -- start to pull in the operands when idle stage is active
+      -- and the op request has been asserted, or the other
+      -- option is to sample it after the load stage has been
+      -- set. This means one extra clock cycle is required.
+      if current_op_req = mm_op_nil and stage_tr_load = '1' then
+        next_op_req <= mm_op_a;
+      end if;
+
       if current_mod_stage = mm_stage_load then
+        -- only run the operand requests when load stage is set
         case current_op_req is
           -- transition sequentially to the next state
           -- when bram request has been acknowledged
           when mm_op_a =>
-            if S_BRAM_REQ_ACK = '1' then
+            if op_in_rdy = '1' then
               next_op_req <= mm_op_b;
             else
               next_op_req <= current_op_req;
             end if;
           when mm_op_b =>
-            if S_BRAM_REQ_ACK = '1' then
+            if op_in_rdy = '1' then
               next_op_req <= mm_op_n;
             else
               next_op_req <= current_op_req;
             end if;
           when mm_op_n =>
-            if S_BRAM_REQ_ACK = '1' then
-              -- load stage completed
-              -- set the next op to nil and assert control signal
-              -- (done in a separate process)
+            if op_in_rdy = '1' then
               next_op_req <= mm_op_nil;
             else
               next_op_req <= current_op_req;
             end if;
-          when mm_op_nil =>
-            -- start with the operand a
-            if op_request = '1' then
-              next_op_req <= mm_op_a;
-            else
-              next_op_req <= current_op_req;
-            end if;
+          when mm_op_nil => null;
+              -- next_op_req <= current_op_req;
         end case;
       end if; -- current_mod_stage
     end if; -- rst and clk
@@ -230,13 +423,12 @@ begin
     if NRST = '0' then
       current_op_req <= mm_op_nil;
     elsif rising_edge (CLK) then
-      current_op_req <= next_op_req; 
+      current_op_req <= next_op_req;
     end if;
   end process;
 
   -- op requested is asserted when the bram ack
   -- is set while current operand requested is mm_op_n
-  -- 
   process (CLK, NRST, current_op_req, S_BRAM_REQ_ACK)
   begin
     if NRST = '0' then
@@ -250,6 +442,25 @@ begin
     end if;
   end process;
 
+  -- make a request to the bram with the given address
+  -- p_bram_req: process (CLK, NRST, current_op_req)
+  -- begin
+  --   if NRST = '0' then
+  --     bram_addr <= ( others => '0' );
+  --   elsif rising_edge (CLK) then
+
+  --     if current_op_req = mm_op_a then
+  --       bram_addr <= OP_A.BASE_ADDRESS;
+  --     elsif current_op_req = mm_op_b then
+  --       bram_addr <= OP_B.BASE_ADDRESS;
+  --     elsif current_op_req = mm_op_n then
+  --       bram_addr <= OP_N.BASE_ADDRESS;
+  --     else
+  --       bram_addr <= ( others => '0' );
+  --     end if;
+
+  --   end if;
+  -- end process;
   -- 2.
   -- calculation needed to be performed
   -- u0 = A[i]
@@ -269,16 +480,16 @@ begin
 
   -- generate N stages to perform the montgomery multiplication
   -- can be increased or decreased depending on the hw requirements
-  mult_stages : for n in (C_MM_MULT_STAGE_COUNT-1) downto 0 generate
-    mult_stage: entity work.mm_mult_stage
-    port map (
-      CLK => CLK,
-      NRST => NRST
+ -- mult_stages : for n in (C_MM_MULT_STAGE_COUNT-1) downto 0 generate
+ --   mult_stage: entity work.mm_mult_stage
+ --   port map (
+ --     CLK => CLK,
+ --     NRST => NRST
       -- OP_A => a_value(n),
       -- OP_B => b_value(n),
       -- OP_N => n_value(n),
-    );
-  end generate mult_stages;
+  --  );
+  --end generate mult_stages;
 
   process (CLK, NRST)
   begin
