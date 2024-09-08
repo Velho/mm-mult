@@ -33,8 +33,10 @@ entity mm_mod is
     C_MM_AXI_ADDR_WIDTH : integer := 32;
     C_MM_MOD_DATA_WIDTH : integer := 64;
     -- bram size of 16K
-    C_MM_MOD_ADDR_WIDTH : integer := 14;
-    C_MM_MULT_STAGE_COUNT : integer := 4
+    C_MM_MOD_ADDR_WIDTH   : integer := 14;
+    C_MM_MULT_STAGE_COUNT : integer := 4;
+    -- result size of the operation
+    C_MM_MULT_RESULT_WIDTH : integer := 4096 -- from the maximum 64 x 64 limb size
   );
   port(
     CLK : in std_logic; -- fabric clock
@@ -53,7 +55,9 @@ entity mm_mod is
     OP_B  : in mm_mult_op;
     OP_N  : in mm_mult_op;
     OP_MM : in mm_mult_result;
-    OP_RESULT : out mm_mult_result
+    OP_RESULT : out mm_mult_result;
+
+    S_DEBUG : out std_logic_vector (63 downto 0)
   );
 end mm_mod;
 
@@ -63,17 +67,6 @@ architecture rtl of mm_mod is
   constant MULT_STAGE_OFFS  : integer := 64;
   constant LAST_OPERAND     : mm_op_req := mm_op_n;
 
-  -- todo(ja): could be moved to the mod_pkg
-  -- mm_mult_result is value type for data
-  type mm_mult_vector is array (0 to C_MM_MULT_STAGE_COUNT-1) of mm_mult_result;
-
-  signal a_in : mm_mult_vector;
-  signal b_in : mm_mult_vector;
-  signal n_in : mm_mult_vector;
-
-  signal a_count : integer;
-  signal b_count : integer;
-  signal n_count : integer;
 
   -- bram control signals
   signal bram_addr : std_logic_vector (C_MM_AXI_ADDR_WIDTH-1 downto 0);
@@ -92,7 +85,11 @@ architecture rtl of mm_mod is
 
   -- request is set in the start of load stage and requested in the end of the load stage
   signal op_request   : std_logic; -- start reading operands from bram
+
+  -- todo: req_completed is asserted after BRAM_ACK is received
+  -- op_requested is asserted when the transition from last operand to nil
   signal op_req_completed : std_logic; -- all operands have been requested from bram
+  signal op_requested : std_logic; -- test / debug
 
   signal op_in  : mm_mult_op;
   signal op_out : mm_mult_result;
@@ -102,9 +99,6 @@ architecture rtl of mm_mod is
   signal op_addr : std_logic_vector (31 downto 0);
 
   signal next_op : std_logic; -- assert to transition next operand
-  signal op_a_in_rdy : std_logic;
-  signal op_b_in_rdy : std_logic;
-  signal op_n_in_rdy : std_logic;
   signal op_in_rdy : std_logic;
 
   signal bram_wait : std_logic;
@@ -115,6 +109,59 @@ architecture rtl of mm_mod is
   signal stage_tr_load : std_logic;
   signal prev_op : mm_op_req;
   signal op_changed : std_logic;
+
+  signal tr_mult_stage: std_logic;
+  -- signal
+
+
+  -- mm mult stage control signals
+  -- signal mm_mult_state : mm_mult_index;
+
+  signal a_in : mm_mult_result;
+  signal b_in : mm_mult_result;
+  signal n_in : mm_mult_result;
+
+  signal a_count : integer;
+  signal b_count : integer;
+  signal n_count : integer;
+
+  signal a0_in    : std_logic_vector (C_MM_MOD_DATA_WIDTH-1 downto 0);
+
+  -- mult stage result
+  -- todo(ja): replace the flat buffer with an array ? could be easier to manage with indeces
+  -- compared to calculating the given offset ?
+  signal mult_stage_result  : std_logic_vector (C_MM_MULT_RESULT_WIDTH-1 downto 0);
+  signal mult_result        : std_logic_vector (C_MM_MOD_DATA_WIDTH-1 downto 0);
+  signal mult_carry         : std_logic_vector (C_MM_MOD_DATA_WIDTH-1 downto 0);
+
+  signal debug : std_logic_vector (C_MM_MOD_DATA_WIDTH-1 downto 0);
+
+  signal mult_active  : std_logic;
+  signal mult_ready   : std_logic;
+
+  signal mult_compl_itrs : integer; -- multiply completed iterations
+
+  -- ja:
+  -- storing the results:
+  -- (1) mm mod was initially designed to produce one result
+  -- at the output port, but that doesn't really make sense
+  -- when mm_mod itself can control the top-level bram controller
+  -- if top-level would like to control the bram controller, the signals
+  -- needs to be muxed
+  -- (2) question is do we push the resulting product directly into the bram
+  -- or do we keep it in buffer of sorts. if we infer small amount of bram
+  -- just by using the hdl then any complicated store operation can be omitted
+  -- while the calculation is still in process. of course for optimization
+  -- reasons it would be nice to be able to write it back to either bram, ddr, or
+  -- whatever for improved resource utilization.
+  -- (3) conclusion would then have a buffer, but this would need to be eventually
+  -- written back to the user, but the axi-ite doesn't support burst reads or writes
+  -- so best would be to push it into bram and allow bram ip core then to perform
+  -- those fast reads
+
+  -- (1) performing the calculation needs some bookkeeping. amount of limbs already
+  -- calculated => how many clock cycles does the operation take ?
+  -- (2) implement the iteration from element to element using the simulation
 
 begin
 
@@ -133,6 +180,11 @@ begin
              OP_N.BASE_ADDRESS when (current_op_req = mm_op_n) else
              ( others => '0' );
 
+  op_requested <= '1' when current_op_req = LAST_OPERAND and next_op_req = mm_op_nil else
+                  '0';
+
+  tr_mult_stage <= '1' when current_mod_stage = mm_stage_load and next_mod_stage = mm_stage_mult else
+                   '0';
 
   -- 1.
   -- start by performing bram read for the different operations
@@ -140,31 +192,6 @@ begin
 
   -- data read from the bram needs to be performed sequentially
   -- starting from the A to B to N and so on or whatever.
-
-  -- p_op_start_req: process (CLK, NRST)
-  -- begin
-  --   -- control the op_load
-  --   -- not to do it in the next_stage as it will just
-  --   -- clutter the state transition logic
-  --   if NRST = '0' then
-  --     op_request <= '0';
-  --   elsif rising_edge (CLK) then
-  --     -- fixme(ja): is this correct condition ?
-  --     -- it takes CONTROL_CLEAR to transition to mm_stage_load
-  --     -- and CONTROL_CLEAR should be asserted for one clock cycle only
-  --     -- so if we are in the load stage already the control clear should
-  --     -- have been de-asserted but what does it then mean if control clear
-  --     -- and stage idle is the condition, do we start pulling the data
-  --     -- on the same clock as we do the transition ? at least we would need
-  --     -- to be in a proper reset state when the bram read is started
-  --     if S_CONTROL_CLEAR = '1' and current_mod_stage = mm_stage_idle then
-  --       op_request <= '1';
-  --     else
-  --       op_request <= '0';
-  --     end if;
-
-  --   end if;
-  -- end process;
 
   -- bram request initiated with the op_request
   -- IN:
@@ -248,7 +275,7 @@ begin
     end if;
   end process;
 
-  -- would it be possible to assign without the clock ??
+  -- samples the bram data when it is ready.
   process(CLK, NRST, bram_sampled)
   begin
     if NRST = '0' then
@@ -260,15 +287,15 @@ begin
       if bram_sampled = '1' then
         case current_op_req is
           when mm_op_a =>
-            a_in(0) <= bram_data;
+            a_in <= bram_data;
             a_count <= a_count + 1;
             op_in_rdy <= '1';
           when mm_op_b =>
-            b_in(0) <= bram_data;
+            b_in <= bram_data;
             b_count <= b_count + 1;
             op_in_rdy <= '1';
           when mm_op_n =>
-            n_in(0) <= bram_data;
+            n_in <= bram_data;
             n_count <= n_count + 1;
             op_in_rdy <= '1';
           when others => null;
@@ -292,7 +319,7 @@ begin
         when mm_stage_load =>
           -- stage load is completed when all operands
           -- have been requested
-          if op_req_completed = '1' then
+          if op_requested = '1' then
             next_mod_stage <= mm_stage_mult;
           -- else
           --   next_mod_stage <= current_mod_stage;
@@ -386,6 +413,7 @@ begin
         next_op_req <= mm_op_a;
       end if;
 
+
       if current_mod_stage = mm_stage_load then
         -- only run the operand requests when load stage is set
         case current_op_req is
@@ -442,31 +470,97 @@ begin
     end if;
   end process;
 
-  -- make a request to the bram with the given address
-  -- p_bram_req: process (CLK, NRST, current_op_req)
-  -- begin
-  --   if NRST = '0' then
-  --     bram_addr <= ( others => '0' );
-  --   elsif rising_edge (CLK) then
-
-  --     if current_op_req = mm_op_a then
-  --       bram_addr <= OP_A.BASE_ADDRESS;
-  --     elsif current_op_req = mm_op_b then
-  --       bram_addr <= OP_B.BASE_ADDRESS;
-  --     elsif current_op_req = mm_op_n then
-  --       bram_addr <= OP_N.BASE_ADDRESS;
-  --     else
-  --       bram_addr <= ( others => '0' );
-  --     end if;
-
-  --   end if;
-  -- end process;
-  -- 2.
+   -- 2.
   -- calculation needed to be performed
   -- u0 = A[i]
   -- u1 = (T[0] + u0 * B[0]) * mm -- where T intermediate result
   -- mla ( d: T, d_len: AN_limbs + 2, s: B, .., b: u0) -- perform T += B * u0
   -- mla ( d: T, .. , s: N, .., b: u1) -- performs T += N * u1
+
+
+  -- drive a0_in from the previous iterations result, in case of negative iteration return first
+  -- a0_in <= mult_stage_result(0) when mult_compl_itrs = 0
+  --          else mult_stage_result(mult_compl_itrs-1);
+  -- a0_in <= std_logic_vector(
+  --          mult_stage_result(
+  --           (mult_compl_itrs * C_MM_MULT_RESULT_WIDTH-1) + C_MM_MULT_RESULT_WIDTH downto mult_compl_itrs * C_MM_MULT_RESULT_WIDTH-1));
+
+  -- results in,
+  -- target has 64 bits, source has 4096 bits
+  -- some problem when elaborating the design even
+  -- if we want to assign only subsection of the source vector
+
+  S_DEBUG <= debug;
+
+  -- control logic for the multiplication stage
+  -- multiplication should start with setting the inputs and asserting ENABLE
+  -- result should be ready when the READY signal has been asserted when we'll
+  -- deassert the
+  p_mult_ctrl: process (CLK, NRST)
+  begin
+    if NRST = '0' then
+      mult_active <= '0';
+      debug <= ( others => '0' );
+    elsif rising_edge (CLK) then
+      -- op requested should be asserted only when transitioning from the
+      -- load stage to the mult stage so there shouldn't be any need to worry
+      -- op requested is asserted only for one clock so we need some additional
+      -- signal..
+      if op_requested = '1' then
+        mult_active <= '1';
+      end if;
+
+      if mult_ready = '1' then
+        mult_active <= '0';
+        -- sample the result
+        debug <= mult_result;
+        -- increment the limb count
+      end if;
+    end if;
+  end process;
+
+  process (CLK, NRST)
+    variable offs : integer := 0;
+  begin
+    if NRST = '0' then
+      a0_in <= ( others => '0' );
+    elsif rising_edge (CLK) then
+      offs := mult_compl_itrs * (C_MM_MOD_DATA_WIDTH-1);
+      a0_in(63 downto 0) <= std_logic_vector(mult_stage_result ( offs + (C_MM_MOD_DATA_WIDTH-1) downto offs));
+    end if;
+  end process;
+
+  -- sample result when ready from the stage_mult has been asserted
+  process (CLK, NRST)
+    variable offs : integer := 0;
+  begin
+    if NRST = '0' then
+      mult_stage_result <= ( others => '0' );
+      mult_compl_itrs <= 0;
+    elsif rising_edge (CLK) then
+      offs := mult_compl_itrs * (C_MM_MOD_DATA_WIDTH-1);
+      -- mult_ready should be de-asserted after one clock
+      if mult_ready = '1' then
+        mult_stage_result(offs + (C_MM_MOD_DATA_WIDTH-1) downto offs) <= mult_result;
+        mult_compl_itrs <= mult_compl_itrs + 1;
+      end if;
+    end if;
+  end process;
+
+  u_stage_mult : entity work.mm_stage_mult
+    port map (
+      CLK     => CLK,
+      NRST    => NRST,
+      S_A       => std_logic_vector(a_in),
+      S_B       => std_logic_vector(b_in),
+      S_N       => std_logic_vector(n_in),
+      S_MM      => std_logic_vector (OP_MM),
+      S_A0      => a0_in,
+      S_CARRY_O => mult_carry,
+      S_RESULT  => mult_result,
+      S_ENABLE  => mult_active,
+      S_READY   => mult_ready
+    );
 
   -- 3.
   -- store the results back into the bram
@@ -477,23 +571,5 @@ begin
   -- having vector of 256-bits would enable to be operated
   -- at the time. where each parallel entity would operate
   -- on 64-bit offset of the vector
-
-  -- generate N stages to perform the montgomery multiplication
-  -- can be increased or decreased depending on the hw requirements
- -- mult_stages : for n in (C_MM_MULT_STAGE_COUNT-1) downto 0 generate
- --   mult_stage: entity work.mm_mult_stage
- --   port map (
- --     CLK => CLK,
- --     NRST => NRST
-      -- OP_A => a_value(n),
-      -- OP_B => b_value(n),
-      -- OP_N => n_value(n),
-  --  );
-  --end generate mult_stages;
-
-  process (CLK, NRST)
-  begin
-
-  end process;
 
 end rtl;
