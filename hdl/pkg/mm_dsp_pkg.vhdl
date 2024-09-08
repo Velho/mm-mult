@@ -18,9 +18,9 @@ package mm_dsp_pkg is
   constant USE_DSP_GENERIC : boolean := false;  -- Generic implementation
 
   subtype t_dsp_vec   is std_logic_vector (64-1 downto 0);
-  subtype t_dsp_ext   is std_logic_vector (127 downto 0);
+  subtype t_dsp_mpi is std_logic_vector (127 downto 0);
   subtype t_dsp_uvec  is unsigned (64-1 downto 0);
-  type    t_dsp_array is array (natural range<>) of unsigned (63 downto 0); -- product size 45-bit
+  type    t_dsp_array is array (natural range<>) of unsigned (44 downto 0); -- product size 45-bit
 
   -- lbl: least significant byte low
   -- lbl: least significant byte high
@@ -141,56 +141,83 @@ package body mm_dsp_pkg is
   -- todo(ja): clean this up
   -- todo(ja): CARRY, this requires to multiplication with larger partial buffers
   -- use 128-bits to calculate the products and sum the carry back into the product
-  function mm_dsp48e2_mult (x, y : t_dsp_vec) return t_dsp_vec is
-    variable prd        : t_dsp_vec; -- resulting product
+  function mm_dsp48e2_mult (x, y : t_dsp_vec) return t_dsp_mpi is
+    variable prd        : t_dsp_mpi;
     variable d_x        : mm_27b_dsp;
     variable d_y        : mm_18b_dsp;
     variable h_prt_prd  : t_dsp_array (0 to 3);
     variable m_prt_prd  : t_dsp_array (0 to 3);
     variable l_prt_prd  : t_dsp_array (0 to 3);
     variable part_sums  : t_dsp_array (0 to 5);
-    variable c          : unsigned (63 downto 0) := ( others => '0' );
+    variable c          : unsigned (127 downto 0) := ( others => '0' );
+    variable sum        : unsigned (127 downto 0) := ( others => '0' );
+    variable padded_hb  : std_logic_vector (26 downto 0); -- padded x 9-bit to 27-bit
+    variable padded_mbh : std_logic_vector (17 downto 0); -- padded y 9-bit to 18-bit
   begin
+    -- unpack the input 64-bit wide words to match the dsp multiplicator widths
     d_x := to_mm_27b_dsp (x);
     d_y := to_mm_18b_dsp (y);
 
+    -- pad the shorter components to same size as others
+    padded_hb := "00000000000000000" & d_x.hb;
+    padded_mbh := "00000000" & d_y.mbh;
+
+    -- multiply the unpacked terms together and resize the product to 128
+    -- afterwards shift the result depending on which terms are being calculated
+
+    -- resizing the products to 128-bits will make use of the RTL_MULT
+    -- elements instead of the dsp elements
+
     -- partial products
-    l_prt_prd(0) := resize (unsigned(d_x.lb) * unsigned(d_y.lbl), 64); -- sll 54;
-    l_prt_prd(1) := resize (unsigned(d_x.lb) * unsigned(d_y.lbh), 64) sll 18; -- sll 36;
-    l_prt_prd(2) := resize (unsigned(d_x.lb) * unsigned(d_y.mbl), 64) sll 36; -- sll 18;
-    l_prt_prd(3) := resize (unsigned(d_x.lb) * unsigned(d_y.mbh), 64) sll 54;
+    l_prt_prd(0) := unsigned(d_x.lb) * unsigned(d_y.lbl);
+    l_prt_prd(1) := unsigned(d_x.lb) * unsigned(d_y.lbh) sll 18;
+    l_prt_prd(2) := unsigned(d_x.lb) * unsigned(d_y.mbl) sll 36;
+    l_prt_prd(3) := unsigned(d_x.lb) * unsigned(padded_mbh) sll 54;
 
-    m_prt_prd(0) := resize(unsigned(d_x.mb) * unsigned(d_y.lbl), 64) sll 27; -- sll 81;
-    m_prt_prd(1) := resize(unsigned(d_x.mb) * unsigned(d_y.lbh), 64) sll 45; -- sll 63;
-    m_prt_prd(2) := resize(unsigned(d_x.mb) * unsigned(d_y.mbl), 64) sll 63; -- sll 45;
-    m_prt_prd(3) := resize(unsigned(d_x.mb) * unsigned(d_y.mbh), 64) sll 81; -- sll 27;
+    report "l(0): " & to_hstring(l_prt_prd(0)) & "h";
+    report "l(1): " & to_hstring(l_prt_prd(1)) & "h";
+    report "l(2): " & to_hstring(l_prt_prd(2)) & "h";
+    report "l(3): " & to_hstring(l_prt_prd(3)) & "h";
 
-    h_prt_prd(0) := resize(unsigned(d_x.hb) * unsigned(d_y.lbl), 64) sll 54; -- sll 108;
-    h_prt_prd(1) := resize(unsigned(d_x.hb) * unsigned(d_y.lbh), 64) sll 72; -- sll 90;
-    h_prt_prd(2) := resize(unsigned(d_x.hb) * unsigned(d_y.mbl), 64) sll 90; -- sll 72;
-    h_prt_prd(3) := resize(unsigned(d_x.hb) * unsigned(d_y.mbh), 64) sll 108; -- sll 54;
+    m_prt_prd(0) := unsigned(d_x.mb) * unsigned(d_y.lbl) sll 27;
+    m_prt_prd(1) := unsigned(d_x.mb) * unsigned(d_y.lbh) sll 45;
+    m_prt_prd(2) := unsigned(d_x.mb) * unsigned(d_y.mbl) sll 63;
+    m_prt_prd(3) := unsigned(d_x.mb) * unsigned(padded_mbh) sll 81;
+
+    report "m(0): " & to_hstring(m_prt_prd(0)) & "h";
+    report "m(1): " & to_hstring(m_prt_prd(1)) & "h";
+    report "m(2): " & to_hstring(m_prt_prd(2)) & "h";
+    report "m(3): " & to_hstring(m_prt_prd(3)) & "h";
+
+    h_prt_prd(0) := unsigned(padded_hb) * unsigned(d_y.lbl) sll 54;
+    h_prt_prd(1) := unsigned(padded_hb) * unsigned(d_y.lbh) sll 72;
+    h_prt_prd(2) := unsigned(padded_hb) * unsigned(d_y.mbl) sll 90;
+    h_prt_prd(3) := unsigned(padded_hb) * unsigned(padded_mbh) sll 108;
+
+    report "h(0): " & to_hstring(h_prt_prd(0)) & "h";
+    report "h(1): " & to_hstring(h_prt_prd(1)) & "h";
+    report "h(2): " & to_hstring(h_prt_prd(2)) & "h";
+    report "h(3): " & to_hstring(h_prt_prd(3)) & "h";
 
     -- high
-    part_sums(0) := h_prt_prd(0) + h_prt_prd(1);
-    report "[h0]: " & to_hstring(h_prt_prd(0)) & " + " & to_hstring(h_prt_prd(1)) & " = " & to_hstring(part_sums(0)) & "h";
-    part_sums(1) := h_prt_prd(2) + h_prt_prd(3);
-    report "[h1]: " & to_hstring(h_prt_prd(2)) & " + " & to_hstring(h_prt_prd(3)) & " = " & to_hstring(part_sums(1)) & "h";
+    sum := h_prt_prd(0) + h_prt_prd(1);
+    sum := sum + h_prt_prd(2) + h_prt_prd(3);
+
     -- mid
-    part_sums(2) := m_prt_prd(0) + m_prt_prd(1);
-    report "[m2]: " & to_hstring(m_prt_prd(0)) & "h + " & to_hstring(m_prt_prd(1)) & "h = " & to_hstring(part_sums(2)) & "h";
-    part_sums(3) := m_prt_prd(2) + m_prt_prd(3);
-    report "[m3]: " & to_hstring(m_prt_prd(2)) & "h + " & to_hstring(m_prt_prd(3)) & "h = " & to_hstring(part_sums(3)) & "h";
+    sum := sum + m_prt_prd(0) + m_prt_prd(1);
+    sum := sum + m_prt_prd(2) + m_prt_prd(3);
 
     -- low
-    part_sums(4) := l_prt_prd(0) + l_prt_prd(1);
-    report "[l4]: " & to_hstring(l_prt_prd(0)) & "h + " & to_hstring(l_prt_prd(1)) & "h = " & to_hstring(part_sums(4)) & "h";
-    part_sums(5) := l_prt_prd(2) + l_prt_prd(3);
-    report "[l5]: " & to_hstring(l_prt_prd(2)) & "h + " & to_hstring(l_prt_prd(3)) & "h = " & to_hstring(part_sums(5)) & "h";
+    sum := sum + l_prt_prd(0) + l_prt_prd(1);
+    sum := sum + l_prt_prd(2) + l_prt_prd(3);
 
-    prd := std_logic_vector(part_sums(0) + part_sums(1) + part_sums(2) + part_sums(3) + part_sums(4) + part_sums(5));
-    report "[prod]: " & to_hstring(prd) & "h";
+    -- truncation should be done outside of the function
+    -- the client will deal then correctly with the carry produced
+    -- truncate product to 64-bits
+    prd := std_logic_vector (sum);
+    report "prd: " & to_hstring(prd) & "h";
 
-    return prd;
+    return std_logic_vector(prd);
   end mm_dsp48e2_mult;
 
 
@@ -231,24 +258,27 @@ package body mm_dsp_pkg is
   -- todo: how does this fit into dsp blocks without the final addition ?
   -- does it cascade properly ? what about carry and borrow ?
 
-  function dsp_mult(x, y: t_dsp_vec) return t_dsp_vec is
+  function dsp_mult(x, y: t_dsp_vec) return t_dsp_mpi is
   begin
     if USE_DSP48_E2 then
       return mm_dsp48e2_mult(x, y);
     elsif USE_DSP_GENERIC then
-      return mm_32b_dsp_mult(x, y);
+      return mm_32b_dsp_mult(x, y); -- tpod
     -- else case should 16b multiplication
     end if;
   end dsp_mult;
 
   -- fixme:
-  function dsp_mult_acc(x, y, a: t_dsp_vec) return t_dsp_vec is
-    variable product  : t_dsp_vec;
-    variable result   : t_dsp_vec;
+  function dsp_mult_acc(x, y, a: t_dsp_vec) return t_dsp_mpi is
+    variable product  : t_dsp_mpi;
+    variable result   : t_dsp_mpi;
   begin
     -- result = x * y + a
     product := dsp_mult (x, y);
-    result  := std_logic_vector(resize (unsigned(product) + unsigned(a), 64));
+    -- result  := std_logic_vector(resize (unsigned(product) + unsigned(a), 64));
+    -- todo still needs to be resized
+    result  := std_logic_vector(unsigned(a) + unsigned(product));
+
     return std_logic_vector(result);
   end dsp_mult_acc;
 
